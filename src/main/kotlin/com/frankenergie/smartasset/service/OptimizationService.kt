@@ -134,9 +134,9 @@ class OptimizationService(
             val shortfall = totalNeed - positionManager.totalPosition()
             if (shortfall <= BigDecimal.ZERO) break
 
-            val hardHeadroom = (chargingNeedAggregator.maxBuyable(quarter)
-                    - positionManager.getPosition(quarter)).max(BigDecimal.ZERO)
-            val softLimit = chargingNeedAggregator.softBuyable(quarter, groupRemaining)
+            val currentQuarterPos   = positionManager.getPosition(quarter)
+            val hardHeadroom = (chargingNeedAggregator.maxBuyable(quarter) - currentQuarterPos).max(BigDecimal.ZERO)
+            val softLimit    = (chargingNeedAggregator.softBuyable(quarter, groupRemaining) - currentQuarterPos).max(BigDecimal.ZERO)
             val qty = shortfall.min(hardHeadroom).min(softLimit).min(askEntry.quantity)
 
             if (qty > BigDecimal.ZERO) {
@@ -208,11 +208,11 @@ class OptimizationService(
 
         // ── Case A: ask dropped → BUY here, SELL at other quarters with highest bid ──
         if (askImproved && newAsk != null) {
-            val askQtyAtUpdated = qtBook.bestAskQuantity ?: BigDecimal.ZERO
-            val maxBuyable = (chargingNeedAggregator.maxBuyable(updatedQuarter)
-                    - positionManager.getPosition(updatedQuarter)).max(BigDecimal.ZERO)
-            val softLimit = chargingNeedAggregator.softBuyable(updatedQuarter, currentGroupRemaining)
-            var remainingToBuy = maxBuyable.min(askQtyAtUpdated).min(softLimit)
+            val askQtyAtUpdated  = qtBook.bestAskQuantity ?: BigDecimal.ZERO
+            val currentPosHere   = positionManager.getPosition(updatedQuarter)
+            val maxBuyable       = (chargingNeedAggregator.maxBuyable(updatedQuarter) - currentPosHere).max(BigDecimal.ZERO)
+            val softLimit        = (chargingNeedAggregator.softBuyable(updatedQuarter, currentGroupRemaining) - currentPosHere).max(BigDecimal.ZERO)
+            var remainingToBuy   = maxBuyable.min(askQtyAtUpdated).min(softLimit)
 
             val sellCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
@@ -245,7 +245,7 @@ class OptimizationService(
         // ── Case B: bid rose → SELL here, BUY at other quarters with lowest ask ───
         if (bidImproved && newBid != null) {
             val bidQtyAtUpdated = qtBook.bestBidQuantity ?: BigDecimal.ZERO
-            var remainingToSell = positionManager.getPosition(updatedQuarter).min(bidQtyAtUpdated)
+            var remainingToSell = positionManager.getPosition(updatedQuarter).min(bidQtyAtUpdated) // TODO: Ensure this sell safe
 
             val buyCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
@@ -256,10 +256,10 @@ class OptimizationService(
             for (candidate in buyCandidates) {
                 if (remainingToSell <= BigDecimal.ZERO) break
                 val askPrice = candidate.bestAskPrice ?: continue
-                val askQtyAtCandidate = candidate.bestAskQuantity ?: BigDecimal.ZERO
-                val softLimitAtCandidate = chargingNeedAggregator.softBuyable(candidate.deliveryStartTime, currentGroupRemaining)
-                val buyable = (chargingNeedAggregator.maxBuyable(candidate.deliveryStartTime)
-                        - positionManager.getPosition(candidate.deliveryStartTime)).max(BigDecimal.ZERO)
+                val askQtyAtCandidate    = candidate.bestAskQuantity ?: BigDecimal.ZERO
+                val currentPosCandidate  = positionManager.getPosition(candidate.deliveryStartTime)
+                val softLimitAtCandidate = (chargingNeedAggregator.softBuyable(candidate.deliveryStartTime, currentGroupRemaining) - currentPosCandidate).max(BigDecimal.ZERO)
+                val buyable = (chargingNeedAggregator.maxBuyable(candidate.deliveryStartTime) - currentPosCandidate).max(BigDecimal.ZERO)
                         .min(askQtyAtCandidate)
                         .min(softLimitAtCandidate)
                 val qty = remainingToSell.min(buyable)

@@ -82,10 +82,8 @@ class SteeringSignalDispatcher(
         positions: Map<LocalDateTime, BigDecimal>
     ): Map<Pair<String, LocalDateTime>, SteeringSignal> {
 
-        // Mutable remaining-need register, initialised from group config
-        val remaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.groups
-            .associate { it.name to it.neededChargeMWh }
-            .toMutableMap()
+        // Mutable remaining-need register, seeded from current dynamic state (not initial config)
+        val remaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.getGroupRemaining().toMutableMap()
 
         val signals = mutableMapOf<Pair<String, LocalDateTime>, SteeringSignal>()
 
