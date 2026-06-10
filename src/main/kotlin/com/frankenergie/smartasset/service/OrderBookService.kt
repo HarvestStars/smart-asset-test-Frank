@@ -6,6 +6,7 @@ import com.frankenergie.smartasset.model.OrderSide
 import com.frankenergie.smartasset.model.OrderUpdateRequest
 import com.frankenergie.smartasset.model.OrderUpdateResponse
 import com.frankenergie.smartasset.model.QuarterBestLevel
+import com.frankenergie.smartasset.model.QuarterOrderBookSnapshot
 import org.springframework.context.ApplicationEventPublisher
 import org.springframework.stereotype.Service
 import java.math.BigDecimal
@@ -108,20 +109,50 @@ class OrderBookService(private val eventPublisher: ApplicationEventPublisher) {
     }
 
     /**
-     * Returns the best bid (highest BUY price) and best ask (lowest SELL price)
-     * for every quarter that has at least one order in the book, sorted by time.
+     * Returns the best bid/ask price and quantity for every quarter that has at
+     * least one order in the book, sorted by delivery time.
      */
     @Synchronized
     fun getQuarterOverviews(): List<QuarterBestLevel> {
         return books.values
             .map { book ->
+                val bestBid = book.buys.maxByOrNull { it.price }
+                val bestAsk = book.sells.minByOrNull { it.price }
                 QuarterBestLevel(
                     deliveryStartTime = book.deliveryStartTime,
                     deliveryEndTime = book.deliveryEndTime,
-                    bestBidPrice = book.buys.maxByOrNull { it.price }?.price,
-                    bestAskPrice = book.sells.minByOrNull { it.price }?.price
+                    bestBidPrice = bestBid?.price,
+                    bestBidQuantity = bestBid?.quantity,
+                    bestAskPrice = bestAsk?.price,
+                    bestAskQuantity = bestAsk?.quantity
                 )
             }
             .sortedBy { it.deliveryStartTime }
     }
+
+    /**
+     * Returns the full order book for a specific quarter (bids sorted best-first,
+     * asks sorted best-first), or null when no orders exist for that quarter.
+     */
+    @Synchronized
+    fun getQuarterOrderBook(deliveryStartTime: LocalDateTime): QuarterOrderBookSnapshot? {
+        val book = books[deliveryStartTime] ?: return null
+        return QuarterOrderBookSnapshot(
+            deliveryStartTime = book.deliveryStartTime,
+            deliveryEndTime = book.deliveryEndTime,
+            bids = book.buys.sortedByDescending { it.price },
+            asks = book.sells.sortedBy { it.price }
+        )
+    }
+
+    /**
+     * Returns every individual SELL order across all quarters, sorted by price
+     * ascending. Used by the fill-up phase to iterate over the full ask depth
+     * rather than just the best ask per quarter.
+     */
+    @Synchronized
+    fun getAllSellOrdersSorted(): List<Pair<LocalDateTime, OrderBookEntry>> =
+        books.values
+            .flatMap { book -> book.sells.map { entry -> book.deliveryStartTime to entry } }
+            .sortedBy { (_, entry) -> entry.price }
 }

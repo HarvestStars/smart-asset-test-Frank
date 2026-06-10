@@ -3,6 +3,7 @@ package com.frankenergie.smartasset.service
 import com.frankenergie.smartasset.client.MarketOrderClient
 import com.frankenergie.smartasset.client.SteeringSignalDispatcher
 import com.frankenergie.smartasset.event.OrderBookUpdatedEvent
+import com.frankenergie.smartasset.model.OrderBookEntry
 import com.frankenergie.smartasset.model.QuarterBestLevel
 import org.slf4j.LoggerFactory
 import org.springframework.context.event.EventListener
@@ -17,16 +18,20 @@ import java.time.LocalDateTime
  *
  *  ┌─ FILL-UP ──────────────────────────────────────────────────────────────────┐
  *  │ Active when: totalPosition < totalEVRemainingNeed                          │
- *  │ Action:      greedy buy-only; cheapest ask first across all quarters;      │
- *  │              respects per-quarter maxBuyable limit (physical power cap).   │
+ *  │ Action:      greedy buy-only; iterates ALL individual ask orders across    │
+ *  │              all quarters sorted by price ascending.                       │
+ *  │              Per-quarter cap: maxBuyable(q) - currentPosition(q).         │
+ *  │              Per-order cap: min(toFill, headroom, askEntry.quantity).      │
  *  │ Exit:        totalPosition ≥ totalEVRemainingNeed                          │
  *  └────────────────────────────────────────────────────────────────────────────┘
  *  ┌─ ARBITRAGE ────────────────────────────────────────────────────────────────┐
  *  │ Active when: totalPosition ≥ totalEVRemainingNeed                          │
  *  │ Anchor:      only the quarter that triggered this event (O(n) not O(n²))   │
  *  │ Early-exit:  if neither ask improved nor bid improved → skip               │
- *  │ If ask dropped (better buy):  BUY here, SELL at quarters with highest bid  │
- *  │ If bid rose  (better sell):   SELL here, BUY at quarters with lowest ask   │
+ *  │ If ask dropped:  BUY here (capped by bestAskQty),                         │
+ *  │                  SELL at candidates (capped by min(pos, bestBidQty))       │
+ *  │ If bid rose:     SELL here (capped by min(pos, bestBidQty)),               │
+ *  │                  BUY at candidates (capped by min(headroom, bestAskQty))   │
  *  │ Invariant:   every trade is paired → totalPosition stays constant          │
  *  └────────────────────────────────────────────────────────────────────────────┘
  *
@@ -51,7 +56,7 @@ class OptimizationService(
     fun onOrderBookUpdated(event: OrderBookUpdatedEvent) {
         val updatedQuarter = event.deliveryStartTime
 
-        // ── Step 1: full overview of all quarters ─────────────────────────────
+        // ── Step 1: full overview + flat ask list ─────────────────────────────
         val currentOverview = orderBookService.getQuarterOverviews()
         val overviewMap = currentOverview.associateBy { it.deliveryStartTime }
 
@@ -62,7 +67,8 @@ class OptimizationService(
         log.info("[Optimizer] trigger={} totalPos={} totalNeed={}", updatedQuarter, totalPos, totalNeed)
 
         if (totalPos < totalNeed) {
-            executeFillUp(totalNeed - totalPos, overviewMap)
+            val allSellOrders = orderBookService.getAllSellOrdersSorted()
+            executeFillUp(totalNeed - totalPos, allSellOrders)
         } else {
             executeArbitrage(updatedQuarter, overviewMap)
         }
@@ -76,23 +82,26 @@ class OptimizationService(
 
     // ─── Fill-up phase ────────────────────────────────────────────────────────
 
-    private fun executeFillUp(shortfall: BigDecimal, overview: Map<LocalDateTime, QuarterBestLevel>) {
-        val sortedAsks = overview.values
-            .filter { it.bestAskPrice != null }
-            .sortedBy { it.bestAskPrice!! }
-
+    /**
+     * Iterates over every individual sell order across all quarters (sorted cheapest
+     * first) and buys as much as possible, respecting:
+     *   - [shortfall]: total MWh still needed
+     *   - maxBuyable(q) - currentPos(q): physical power headroom per quarter
+     *   - askEntry.quantity: market depth of each individual ask level
+     */
+    private fun executeFillUp(shortfall: BigDecimal, allSellOrders: List<Pair<LocalDateTime, OrderBookEntry>>) {
         var toFill = shortfall
 
-        for (level in sortedAsks) {
+        for ((quarter, askEntry) in allSellOrders) {
             if (toFill <= BigDecimal.ZERO) break
 
-            val headroom = (chargingNeedAggregator.maxBuyable(level.deliveryStartTime)
-                    - positionManager.getPosition(level.deliveryStartTime)).max(BigDecimal.ZERO)
-            val qty = toFill.min(headroom)
+            val headroom = (chargingNeedAggregator.maxBuyable(quarter)
+                    - positionManager.getPosition(quarter)).max(BigDecimal.ZERO)
+            val qty = toFill.min(headroom).min(askEntry.quantity)
 
             if (qty > BigDecimal.ZERO) {
-                marketOrderClient.placeBuy(level.deliveryStartTime, level.deliveryEndTime, qty, level.bestAskPrice!!)
-                positionManager.adjustPosition(level.deliveryStartTime, qty)
+                marketOrderClient.placeBuy(quarter, askEntry.deliveryEndTime, qty, askEntry.price)
+                positionManager.adjustPosition(quarter, qty)
                 toFill -= qty
             }
         }
@@ -122,10 +131,13 @@ class OptimizationService(
         }
 
         // ── Case A: ask dropped → BUY here, SELL at other quarters with highest bid ──
+        // Cap remainingToBuy by the available ask quantity to avoid committing
+        // more sells than we can actually cover with the buy at this quarter.
         if (askImproved && newAsk != null) {
+            val askQtyAtUpdated = qtBook.bestAskQuantity ?: BigDecimal.ZERO
             val maxBuyable = (chargingNeedAggregator.maxBuyable(updatedQuarter)
                     - positionManager.getPosition(updatedQuarter)).max(BigDecimal.ZERO)
-            var remainingToBuy = maxBuyable
+            var remainingToBuy = maxBuyable.min(askQtyAtUpdated)
 
             val sellCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
@@ -134,7 +146,9 @@ class OptimizationService(
 
             for (candidate in sellCandidates) {
                 if (remainingToBuy <= BigDecimal.ZERO) break
-                val sellable = positionManager.getPosition(candidate.deliveryStartTime)
+                // Cap sellable by bestBidQty: selling more than the bid can absorb is pointless
+                val bidQtyAtCandidate = candidate.bestBidQuantity ?: BigDecimal.ZERO
+                val sellable = positionManager.getPosition(candidate.deliveryStartTime).min(bidQtyAtCandidate)
                 val qty = remainingToBuy.min(sellable)
                 if (qty > BigDecimal.ZERO) {
                     log.info(
@@ -153,8 +167,10 @@ class OptimizationService(
         }
 
         // ── Case B: bid rose → SELL here, BUY at other quarters with lowest ask ───
+        // Cap remainingToSell by bestBidQty: we can only hit as much of the bid as exists.
         if (bidImproved && newBid != null) {
-            var remainingToSell = positionManager.getPosition(updatedQuarter)
+            val bidQtyAtUpdated = qtBook.bestBidQuantity ?: BigDecimal.ZERO
+            var remainingToSell = positionManager.getPosition(updatedQuarter).min(bidQtyAtUpdated)
 
             val buyCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
@@ -163,8 +179,11 @@ class OptimizationService(
 
             for (candidate in buyCandidates) {
                 if (remainingToSell <= BigDecimal.ZERO) break
+                // Cap buyable by bestAskQty: buying more than the ask offers is impossible
+                val askQtyAtCandidate = candidate.bestAskQuantity ?: BigDecimal.ZERO
                 val buyable = (chargingNeedAggregator.maxBuyable(candidate.deliveryStartTime)
                         - positionManager.getPosition(candidate.deliveryStartTime)).max(BigDecimal.ZERO)
+                        .min(askQtyAtCandidate)
                 val qty = remainingToSell.min(buyable)
                 if (qty > BigDecimal.ZERO) {
                     log.info(

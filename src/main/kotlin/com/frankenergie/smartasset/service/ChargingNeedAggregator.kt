@@ -1,8 +1,10 @@
 package com.frankenergie.smartasset.service
 
+import com.frankenergie.smartasset.config.SmartAssetConfig
 import com.frankenergie.smartasset.model.ChargingGroup
 import org.springframework.stereotype.Component
 import java.math.BigDecimal
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 
@@ -19,22 +21,27 @@ import java.time.LocalTime
  *                        Used as the fill-up target; arbitrage keeps total
  *                        position at or above this floor.
  *
+ * Groups and trading date are loaded from application.properties via SmartAssetConfig.
  * The optimizer only sees these two numbers – it never looks at individual
  * groups directly.
  */
 @Component
-class ChargingNeedAggregator {
+class ChargingNeedAggregator(private val config: SmartAssetConfig) {
 
     private val QUARTER_HOURS = BigDecimal("0.25")
 
-    val groups: List<ChargingGroup> = listOf(
-        ChargingGroup("A", LocalTime.of(0,  0),  LocalTime.of(8,  30), BigDecimal("5"),  BigDecimal("2")),
-        ChargingGroup("B", LocalTime.of(0,  0),  LocalTime.of(11, 0),  BigDecimal("10"), BigDecimal("3")),
-        ChargingGroup("C", LocalTime.of(13, 0),  LocalTime.of(18, 0),  BigDecimal("4"),  BigDecimal("1")),
-        ChargingGroup("D", LocalTime.of(13, 0),  LocalTime.of(21, 0),  BigDecimal("20"), BigDecimal("6")),
-        ChargingGroup("E", LocalTime.of(17, 30), LocalTime.of(22, 0),  BigDecimal("5"),  BigDecimal("2")),
-        ChargingGroup("F", LocalTime.of(17, 30), LocalTime.of(23, 59), BigDecimal("15"), BigDecimal("5"))
-    )  // total = 59 MWh
+    val tradingDate: LocalDate = LocalDate.parse(config.tradingDate)
+
+    val groups: List<ChargingGroup> = config.chargingGroups.map { it.toChargingGroup() }
+
+    /**
+     * All 96 quarter start times for the configured trading date (00:00 … 23:45),
+     * useful for iterating over every delivery slot regardless of whether the
+     * order book currently has orders for that slot.
+     */
+    fun getAllQuarters(): List<LocalDateTime> = (0 until 96).map { i ->
+        LocalDateTime.of(tradingDate, LocalTime.MIDNIGHT).plusMinutes(i * 15L)
+    }
 
     /** Sum of all group needs (simplified: no time-passing simulation). */
     fun totalRemainingNeed(): BigDecimal =
