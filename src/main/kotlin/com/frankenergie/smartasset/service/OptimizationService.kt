@@ -20,9 +20,9 @@ import java.time.LocalDateTime
  *  │ Active when: totalPosition < totalEVRemainingNeed                          │
  *  │ Action:      greedy buy-only; iterates ALL individual ask orders across    │
  *  │              all quarters sorted by price ascending.                       │
- *  │              Per-quarter cap: maxBuyable(q) - currentPosition(q).         │
+ *  │              Per-quarter cap: maxBuyable(q) - currentPosition(q).          │
  *  │              Per-order cap: min(shortfall, headroom, askEntry.quantity).   │
- *  │              Position is updated BEFORE placeBuy so that any re-entrant   │
+ *  │              Position is updated BEFORE placeBuy so that any re-entrant    │
  *  │              event triggered by our own order sees the correct state and   │
  *  │              terminates when shortfall reaches zero.                       │
  *  │ Exit:        totalPosition ≥ totalEVRemainingNeed                          │
@@ -31,7 +31,7 @@ import java.time.LocalDateTime
  *  │ Active when: totalPosition ≥ totalEVRemainingNeed                          │
  *  │ Anchor:      only the quarter that triggered this event (O(n) not O(n²))   │
  *  │ Early-exit:  if neither ask improved nor bid improved → skip               │
- *  │ If ask dropped:  BUY here (capped by bestAskQty),                         │
+ *  │ If ask dropped:  BUY here (capped by bestAskQty),                          │
  *  │                  SELL at candidates (capped by min(pos, bestBidQty))       │
  *  │ If bid rose:     SELL here (capped by min(pos, bestBidQty)),               │
  *  │                  BUY at candidates (capped by min(headroom, bestAskQty))   │
@@ -56,24 +56,31 @@ class OptimizationService(
     // Best ask/bid snapshot from the previous event; used for arbitrage delta detection
     private val previousSnapshot = HashMap<LocalDateTime, QuarterBestLevel>()
 
-    // Conservative upper bound for softBuyable in arbitrage: full initial group needs.
-    // Arbitrage reshuffles existing positions rather than adding net inventory, so we
-    // don't track per-group remaining in real-time here.  Using initial needs ensures
-    // we never buy into a quarter where NO group has any window (softBuyable → 0),
-    // while accepting a small over-estimate for groups that are partially satisfied.
-    private val initialGroupNeeds: Map<String, BigDecimal> =
-        chargingNeedAggregator.groups.associate { it.name to it.neededChargeMWh }
-
     @EventListener
     @Synchronized
     fun onOrderBookUpdated(event: OrderBookUpdatedEvent) {
         val updatedQuarter = event.deliveryStartTime
+        val now = LocalDateTime.now()
 
-        // ── Step 1: full overview + flat ask list ─────────────────────────────
+        // ── Step 1: expire past positions and account for what was charged ────
+        val expired = positionManager.expireBeforeTime(now)
+        if (expired.isNotEmpty()) {
+            val charged = steeringSignalDispatcher.getLastSignalsForQuarters(expired.keys)
+            chargingNeedAggregator.consumeChargedEnergy(charged)
+            log.info("[Optimizer] Expired {} past quarters, consumed charged energy for {} signals", expired.size, charged.size)
+        }
+
+        // ── Step 2: reject stale order-book events (market delay / manipulation) ─
+        if (updatedQuarter.isBefore(now)) {
+            log.warn("[Optimizer] Ignoring stale event for past quarter {} (now={})", updatedQuarter, now)
+            return
+        }
+
+        // ── Step 3: full overview + flat ask list ─────────────────────────────
         val currentOverview = orderBookService.getQuarterOverviews()
         val overviewMap = currentOverview.associateBy { it.deliveryStartTime }
 
-        // ── Step 2: phase selection ───────────────────────────────────────────
+        // ── Step 4: phase selection ───────────────────────────────────────────
         val totalNeed = chargingNeedAggregator.totalRemainingNeed()
         val totalPos  = positionManager.totalPosition()
 
@@ -84,15 +91,15 @@ class OptimizationService(
 
         if (totalPos < totalNeed) {
             val allSellOrders = orderBookService.getAllSellOrdersSorted()
-            executeFillUp(totalNeed, allSellOrders)
+            executeFillUp(now, allSellOrders)
         } else {
-            executeArbitrage(updatedQuarter, overviewMap)
+            executeArbitrage(now, updatedQuarter, overviewMap)
         }
 
-        // ── Step 3: persist snapshot for next event comparison ────────────────
+        // ── Step 5: persist snapshot for next event comparison ────────────────
         overviewMap.forEach { (k, v) -> previousSnapshot[k] = v }
 
-        // ── Step 4: dispatch incremental steering signals to EV groups ────────
+        // ── Step 6: dispatch incremental steering signals to EV groups ────────
         steeringSignalDispatcher.dispatch(positionManager.getAllPositions())
     }
 
@@ -116,12 +123,14 @@ class OptimizationService(
      * Position is updated BEFORE placeBuy so that re-entrant events see the correct
      * totalPos and terminate naturally.
      */
-    private fun executeFillUp(totalNeed: BigDecimal, allSellOrders: List<Pair<LocalDateTime, OrderBookEntry>>) {
-        val groupRemaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.groups
-            .associate { it.name to it.neededChargeMWh }
-            .toMutableMap()
+    private fun executeFillUp(now: LocalDateTime, allSellOrders: List<Pair<LocalDateTime, OrderBookEntry>>) {
+        val totalNeed = chargingNeedAggregator.totalRemainingNeed()
+        // Seed from current remaining (not initial config) so past-quarter consumption is reflected
+        val groupRemaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.getGroupRemaining().toMutableMap()
 
         for ((quarter, askEntry) in allSellOrders) {
+            if (quarter.isBefore(now)) continue   // skip past-quarter asks (stale order book)
+
             val shortfall = totalNeed - positionManager.totalPosition()
             if (shortfall <= BigDecimal.ZERO) break
 
@@ -177,7 +186,7 @@ class OptimizationService(
 
     // ─── Arbitrage phase ──────────────────────────────────────────────────────
 
-    private fun executeArbitrage(updatedQuarter: LocalDateTime, overview: Map<LocalDateTime, QuarterBestLevel>) {
+    private fun executeArbitrage(now: LocalDateTime, updatedQuarter: LocalDateTime, overview: Map<LocalDateTime, QuarterBestLevel>) {
         val qtBook   = overview[updatedQuarter] ?: return
         val prevBook = previousSnapshot[updatedQuarter]
 
@@ -194,25 +203,26 @@ class OptimizationService(
             return
         }
 
+        // Snapshot of actual remaining need — used as soft cap for arbitrage buys
+        val currentGroupRemaining = chargingNeedAggregator.getGroupRemaining()
+
         // ── Case A: ask dropped → BUY here, SELL at other quarters with highest bid ──
-        // Natural guard: after we consume the ask, any re-triggered event for this
-        // quarter will find newAsk ≥ prevAsk (or null) → askImproved=false → exits.
         if (askImproved && newAsk != null) {
             val askQtyAtUpdated = qtBook.bestAskQuantity ?: BigDecimal.ZERO
             val maxBuyable = (chargingNeedAggregator.maxBuyable(updatedQuarter)
                     - positionManager.getPosition(updatedQuarter)).max(BigDecimal.ZERO)
-            // Soft limit: groups still needing energy in this quarter (conservative: full initial needs)
-            val softLimit = chargingNeedAggregator.softBuyable(updatedQuarter, initialGroupNeeds)
+            val softLimit = chargingNeedAggregator.softBuyable(updatedQuarter, currentGroupRemaining)
             var remainingToBuy = maxBuyable.min(askQtyAtUpdated).min(softLimit)
 
             val sellCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
+                .filter { !it.deliveryStartTime.isBefore(now) }   // skip expired quarters
                 .filter { it.bestBidPrice != null && it.bestBidPrice > newAsk }
                 .sortedByDescending { it.bestBidPrice!! }
 
             for (candidate in sellCandidates) {
                 if (remainingToBuy <= BigDecimal.ZERO) break
-                val bidPrice = candidate.bestBidPrice ?: continue   // non-null guaranteed by filter
+                val bidPrice = candidate.bestBidPrice ?: continue
                 val bidQtyAtCandidate = candidate.bestBidQuantity ?: BigDecimal.ZERO
                 val sellable = positionManager.getPosition(candidate.deliveryStartTime).min(bidQtyAtCandidate)
                 val qty = remainingToBuy.min(sellable)
@@ -223,7 +233,6 @@ class OptimizationService(
                         qty, newAsk, updatedQuarter,
                         bidPrice - newAsk
                     )
-                    // Update positions BEFORE submitting so re-entrant events see correct state
                     positionManager.adjustPosition(candidate.deliveryStartTime, qty.negate())
                     positionManager.adjustPosition(updatedQuarter, qty)
                     marketOrderClient.placeSell(candidate.deliveryStartTime, candidate.deliveryEndTime, qty, bidPrice)
@@ -234,22 +243,21 @@ class OptimizationService(
         }
 
         // ── Case B: bid rose → SELL here, BUY at other quarters with lowest ask ───
-        // Natural guard: after we consume the bid, any re-triggered event for this
-        // quarter will find newBid ≤ prevBid (or null) → bidImproved=false → exits.
         if (bidImproved && newBid != null) {
             val bidQtyAtUpdated = qtBook.bestBidQuantity ?: BigDecimal.ZERO
             var remainingToSell = positionManager.getPosition(updatedQuarter).min(bidQtyAtUpdated)
 
             val buyCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
+                .filter { !it.deliveryStartTime.isBefore(now) }   // skip expired quarters
                 .filter { it.bestAskPrice != null && it.bestAskPrice < newBid }
                 .sortedBy { it.bestAskPrice!! }
 
             for (candidate in buyCandidates) {
                 if (remainingToSell <= BigDecimal.ZERO) break
-                val askPrice = candidate.bestAskPrice ?: continue    // non-null guaranteed by filter
+                val askPrice = candidate.bestAskPrice ?: continue
                 val askQtyAtCandidate = candidate.bestAskQuantity ?: BigDecimal.ZERO
-                val softLimitAtCandidate = chargingNeedAggregator.softBuyable(candidate.deliveryStartTime, initialGroupNeeds)
+                val softLimitAtCandidate = chargingNeedAggregator.softBuyable(candidate.deliveryStartTime, currentGroupRemaining)
                 val buyable = (chargingNeedAggregator.maxBuyable(candidate.deliveryStartTime)
                         - positionManager.getPosition(candidate.deliveryStartTime)).max(BigDecimal.ZERO)
                         .min(askQtyAtCandidate)
@@ -262,7 +270,6 @@ class OptimizationService(
                         qty, askPrice, candidate.deliveryStartTime,
                         newBid - askPrice
                     )
-                    // Update positions BEFORE submitting so re-entrant events see correct state
                     positionManager.adjustPosition(updatedQuarter, qty.negate())
                     positionManager.adjustPosition(candidate.deliveryStartTime, qty)
                     marketOrderClient.placeSell(updatedQuarter, qtBook.deliveryEndTime, qty, newBid)

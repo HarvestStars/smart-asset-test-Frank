@@ -9,21 +9,17 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 
 /**
- * Translates EV-fleet constraints into two position-limit numbers that the
- * market trading layer consumes:
+ * Translates EV-fleet constraints into position-limit numbers for the optimizer.
  *
- *   maxBuyable(q)      – physical ceiling: how much energy can actually be
- *                        consumed in quarter q (sum of max-power across all
- *                        groups whose window covers q × 0.25 h).
- *                        Prevents over-buying energy that cannot be used.
+ * Static limits (from config):
+ *   maxBuyable(q)  – physical ceiling per quarter (sum of overlapping group max-powers × 0.25 h)
  *
- *   totalRemainingNeed – total MWh still required across all groups.
- *                        Used as the fill-up target; arbitrage keeps total
- *                        position at or above this floor.
+ * Dynamic limits (updated at runtime):
+ *   softBuyable(q, remaining) – actual remaining group needs for quarter q
+ *   totalRemainingNeed()      – sum of all group remaining needs
  *
- * Groups and trading date are loaded from application.properties via SmartAssetConfig.
- * The optimizer only sees these two numbers – it never looks at individual
- * groups directly.
+ * [groupRemaining] starts equal to each group's configured neededChargeMWh and shrinks
+ * as quarters expire and their charged energy is consumed via [consumeChargedEnergy].
  */
 @Component
 class ChargingNeedAggregator(private val config: SmartAssetConfig) {
@@ -34,18 +30,47 @@ class ChargingNeedAggregator(private val config: SmartAssetConfig) {
 
     val groups: List<ChargingGroup> = config.chargingGroups.map { it.toChargingGroup() }
 
+    // Dynamic remaining need per group — decremented when past quarters expire
+    private val groupRemaining: MutableMap<String, BigDecimal> =
+        groups.associate { it.name to it.neededChargeMWh }.toMutableMap()
+
     /**
-     * All 96 quarter start times for the configured trading date (00:00 … 23:45),
-     * useful for iterating over every delivery slot regardless of whether the
-     * order book currently has orders for that slot.
+     * All 96 quarter start times for the configured trading date (00:00 … 23:45).
      */
     fun getAllQuarters(): List<LocalDateTime> = (0 until 96).map { i ->
         LocalDateTime.of(tradingDate, LocalTime.MIDNIGHT).plusMinutes(i * 15L)
     }
 
-    /** Sum of all group needs (simplified: no time-passing simulation). */
+    /**
+     * Current snapshot of remaining charge need per group.
+     * Callers should treat this as read-only; mutations go through [consumeChargedEnergy].
+     */
+    @Synchronized
+    fun getGroupRemaining(): Map<String, BigDecimal> = groupRemaining.toMap()
+
+    /**
+     * Total MWh still required across all groups.
+     * Decreases as quarters expire and their charged energy is accounted for.
+     */
+    @Synchronized
     fun totalRemainingNeed(): BigDecimal =
-        groups.sumOf { it.neededChargeMWh }
+        groupRemaining.values.fold(BigDecimal.ZERO, BigDecimal::add)
+
+    /**
+     * Deducts charged energy from [groupRemaining] when a past quarter expires.
+     *
+     * [chargedMap] maps (groupName, quarter) → commandedEnergyMwh from the last
+     * steering signal for that slot.  We assume EV groups comply with the last
+     * received signal, so commanded energy equals actual energy consumed.
+     */
+    @Synchronized
+    fun consumeChargedEnergy(chargedMap: Map<Pair<String, LocalDateTime>, BigDecimal>) {
+        for ((key, charged) in chargedMap) {
+            val (groupName, _) = key
+            val current = groupRemaining[groupName] ?: continue
+            groupRemaining[groupName] = (current - charged).max(BigDecimal.ZERO)
+        }
+    }
 
     /**
      * Hard upper bound: maximum energy physically consumable in [quarter].
@@ -65,16 +90,15 @@ class ChargingNeedAggregator(private val config: SmartAssetConfig) {
      * Uses the same desire formula as SteeringSignalDispatcher.deriveSignals:
      *   desire_g = min(remaining_g, maxPower_g × 0.25 h)
      *
-     * This prevents the optimizer from buying energy in a quarter that no group
-     * still needs, even if the hard limit (maxBuyable) is non-zero.
-     * [groupRemaining] keys are group names; missing entries default to the group's
-     * full neededChargeMWh (conservative upper bound).
+     * [groupRemaining] is passed explicitly so the fill-up phase can supply its own
+     * session-level tracking register (which is decremented with each buy within
+     * a single fill-up pass) rather than always reading the persistent internal state.
      */
     fun softBuyable(quarter: LocalDateTime, groupRemaining: Map<String, BigDecimal>): BigDecimal {
         return groups
             .filter { isInGroupWindow(quarter, it) }
             .fold(BigDecimal.ZERO) { acc, g ->
-                val remaining = groupRemaining[g.name] ?: g.neededChargeMWh
+                val remaining = groupRemaining[g.name] ?: BigDecimal.ZERO
                 acc + remaining.min(g.maxPowerMW * QUARTER_HOURS)
             }
     }

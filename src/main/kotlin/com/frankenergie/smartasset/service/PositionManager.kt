@@ -30,4 +30,22 @@ class PositionManager {
 
     @Synchronized
     fun getAllPositions(): Map<LocalDateTime, BigDecimal> = positions.toMap()
+
+    /**
+     * Removes all quarters whose delivery start is strictly before [cutoff] and
+     * returns the entries that were removed.
+     *
+     * Called at the start of each optimizer cycle to expire positions for
+     * quarters whose delivery window has already passed — the energy they
+     * represented has been consumed by EV groups and is no longer part of
+     * our tradeable inventory.
+     */
+    @Synchronized
+    fun expireBeforeTime(cutoff: LocalDateTime): Map<LocalDateTime, BigDecimal> {
+        val expired = positions.entries
+            .filter { (quarter, _) -> quarter.isBefore(cutoff) }
+            .associate { (quarter, qty) -> quarter to qty }
+        expired.keys.forEach { positions.remove(it) }
+        return expired
+    }
 }

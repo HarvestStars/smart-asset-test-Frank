@@ -50,6 +50,19 @@ class SteeringSignalDispatcher(
     // Incremental tracking: (group, deliveryStart) → last emitted SteeringSignal
     private val lastSignals = HashMap<Pair<String, LocalDateTime>, SteeringSignal>()
 
+    /**
+     * Returns the last commanded energy (MWh) for every (group, quarter) pair
+     * whose quarter falls in [quarters].
+     *
+     * Used by the optimizer when positions expire: the commanded energy is the
+     * best available proxy for how much each group actually charged in that slot
+     * (mock assumption: EV groups comply with the last received signal).
+     */
+    fun getLastSignalsForQuarters(quarters: Set<LocalDateTime>): Map<Pair<String, LocalDateTime>, BigDecimal> =
+        lastSignals
+            .filterKeys { (_, quarter) -> quarter in quarters }
+            .mapValues { (_, signal) -> signal.commandedEnergyMwh }
+
     fun dispatch(positions: Map<LocalDateTime, BigDecimal>) {
         val newSignals = deriveSignals(positions)
         emitChanged(newSignals)
