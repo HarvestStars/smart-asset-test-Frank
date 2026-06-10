@@ -14,9 +14,8 @@ import java.time.LocalTime
  * Static limits (from config):
  *   maxBuyable(q)  – physical ceiling per quarter (sum of overlapping group max-powers × 0.25 h)
  *
- * Dynamic limits (updated at runtime):
- *   softBuyable(q, remaining) – actual remaining group needs for quarter q
- *   totalRemainingNeed()      – sum of all group remaining needs
+ * Dynamic state (updated at runtime):
+ *   totalRemainingNeed() – sum of all group remaining needs
  *
  * [groupRemaining] starts equal to each group's configured neededChargeMWh and shrinks
  * as quarters expire and their charged energy is consumed via [consumeChargedEnergy].
@@ -81,26 +80,6 @@ class ChargingNeedAggregator(private val config: SmartAssetConfig) {
         return groups
             .filter { isInGroupWindow(quarter, it) }
             .fold(BigDecimal.ZERO) { acc, g -> acc + g.maxPowerMW * QUARTER_HOURS }
-    }
-
-    /**
-     * Soft upper bound: how much energy active groups ACTUALLY still need from [quarter],
-     * given their current [groupRemaining] balances.
-     *
-     * Uses the same desire formula as SteeringSignalDispatcher.deriveSignals:
-     *   desire_g = min(remaining_g, maxPower_g × 0.25 h)
-     *
-     * [groupRemaining] is passed explicitly so the fill-up phase can supply its own
-     * session-level tracking register (which is decremented with each buy within
-     * a single fill-up pass) rather than always reading the persistent internal state.
-     */
-    fun softBuyable(quarter: LocalDateTime, groupRemaining: Map<String, BigDecimal>): BigDecimal {
-        return groups
-            .filter { isInGroupWindow(quarter, it) }
-            .fold(BigDecimal.ZERO) { acc, g ->
-                val remaining = groupRemaining[g.name] ?: BigDecimal.ZERO
-                acc + remaining.min(g.maxPowerMW * QUARTER_HOURS)
-            }
     }
 
     fun isInGroupWindow(quarter: LocalDateTime, group: ChargingGroup): Boolean {

@@ -1,5 +1,6 @@
 package com.frankenergie.smartasset.service
 
+import com.frankenergie.smartasset.allocation.ChargingAllocationStrategy
 import com.frankenergie.smartasset.client.MarketOrderClient
 import com.frankenergie.smartasset.client.SteeringSignalDispatcher
 import com.frankenergie.smartasset.event.OrderBookUpdatedEvent
@@ -48,7 +49,8 @@ class OptimizationService(
     private val positionManager: PositionManager,
     private val chargingNeedAggregator: ChargingNeedAggregator,
     private val marketOrderClient: MarketOrderClient,
-    private val steeringSignalDispatcher: SteeringSignalDispatcher
+    private val steeringSignalDispatcher: SteeringSignalDispatcher,
+    private val allocationStrategy: ChargingAllocationStrategy
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -56,6 +58,18 @@ class OptimizationService(
     // Best ask/bid snapshot from the previous event; used for arbitrage delta detection
     private val previousSnapshot = HashMap<LocalDateTime, QuarterBestLevel>()
 
+    /**
+     * Runs one complete optimization cycle for an order-book change.
+     *
+     * The cycle first expires delivered positions and records their charged energy.
+     * It then chooses exactly one mode:
+     *
+     * - Fill-up when total inventory is below actual remaining fleet demand.
+     * - Arbitrage when enough total inventory exists and positions may be relocated.
+     *
+     * Finally, the resulting position layout is converted to group-level steering
+     * signals through the shared [allocationStrategy].
+     */
     @EventListener
     @Synchronized
     fun onOrderBookUpdated(event: OrderBookUpdatedEvent) {
@@ -108,25 +122,32 @@ class OptimizationService(
     /**
      * Iterates the globally sorted ask list and buys the cheapest available energy.
      *
-     * Two-level headroom per quarter:
-     *   Hard limit  = maxBuyable(Q) - position(Q)   [physical power ceiling]
-     *   Soft limit  = softBuyable(Q, groupRemaining) [actual remaining group needs]
+     * Each ask is first capped by total shortfall, physical quarter headroom and
+     * market quantity. The allocation strategy then determines how much of that
+     * candidate quantity can actually serve currently uncovered group demand.
      *
-     * The soft limit is tighter whenever some groups have already been satisfied
-     * from cheaper quarters further up the sorted list.  Without it, we could buy
-     * energy for a quarter that no group still needs — stranded inventory.
-     *
-     * groupRemaining is updated proportionally after each purchase (same weighting
-     * as SteeringSignalDispatcher.deriveSignals), keeping buying and signal-dispatch
-     * consistent.
+     * Existing positions are allocated first, producing the demand not yet covered
+     * by the current layout. Each purchase updates that temporary state through the
+     * same strategy used by steering-signal dispatch.
      *
      * Position is updated BEFORE placeBuy so that re-entrant events see the correct
      * totalPos and terminate naturally.
+     *
+     * @param now current wall-clock time; asks for earlier quarters are ignored.
+     * @param allSellOrders every available ask as `(quarter, order)`, sorted globally
+     * by price from cheapest to most expensive.
      */
     private fun executeFillUp(now: LocalDateTime, allSellOrders: List<Pair<LocalDateTime, OrderBookEntry>>) {
         val totalNeed = chargingNeedAggregator.totalRemainingNeed()
-        // Seed from current remaining (not initial config) so past-quarter consumption is reflected
-        val groupRemaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.getGroupRemaining().toMutableMap()
+
+        // Start from actual EV demand, then subtract whatever the current position
+        // layout can already cover. This state is temporary and may be rebuilt after
+        // any future arbitrage move; it does not permanently bind inventory to groups.
+        var uncoveredRemaining = allocationStrategy.allocatePositions(
+            groups = chargingNeedAggregator.groups,
+            remainingNeed = chargingNeedAggregator.getGroupRemaining(),
+            positions = positionManager.getAllPositions()
+        ).remainingByGroup
 
         for ((quarter, askEntry) in allSellOrders) {
             if (quarter.isBefore(now)) continue   // skip past-quarter asks (stale order book)
@@ -136,11 +157,20 @@ class OptimizationService(
 
             val currentQuarterPos   = positionManager.getPosition(quarter)
             val hardHeadroom = (chargingNeedAggregator.maxBuyable(quarter) - currentQuarterPos).max(BigDecimal.ZERO)
-            val softLimit    = (chargingNeedAggregator.softBuyable(quarter, groupRemaining) - currentQuarterPos).max(BigDecimal.ZERO)
-            val qty = shortfall.min(hardHeadroom).min(softLimit).min(askEntry.quantity)
+            val candidateQuantity = shortfall.min(hardHeadroom).min(askEntry.quantity)
+
+            // One allocation call both limits the purchase to useful energy and
+            // produces the uncovered-demand snapshot for the next ask.
+            val allocation = allocationStrategy.allocateQuarter(
+                groups = chargingNeedAggregator.groups,
+                remainingNeed = uncoveredRemaining,
+                quarter = quarter,
+                availableEnergy = candidateQuantity
+            )
+            val qty = allocation.allocatedEnergy
 
             if (qty > BigDecimal.ZERO) {
-                applyGroupAllocation(quarter, qty, groupRemaining)
+                uncoveredRemaining = allocation.remainingByGroup
                 positionManager.adjustPosition(quarter, qty)
                 marketOrderClient.placeBuy(quarter, askEntry.deliveryEndTime, qty, askEntry.price)
             }
@@ -152,40 +182,22 @@ class OptimizationService(
         }
     }
 
-    /**
-     * Mirrors SteeringSignalDispatcher's proportional allocation: deducts from
-     * [groupRemaining] in proportion to each active group's desire for [quarter].
-     * Called after each fill-up purchase so the soft limit stays accurate.
-     */
-    private fun applyGroupAllocation(
-        quarter: LocalDateTime,
-        qtyBought: BigDecimal,
-        groupRemaining: MutableMap<String, BigDecimal>
-    ) {
-        val active = chargingNeedAggregator.groups.filter { g ->
-            chargingNeedAggregator.isInGroupWindow(quarter, g) &&
-            (groupRemaining[g.name] ?: BigDecimal.ZERO) > BigDecimal.ZERO
-        }
-        if (active.isEmpty()) return
-
-        val desires = active.associate { g ->
-            g.name to (groupRemaining[g.name]!!).min(g.maxPowerMW * BigDecimal("0.25"))
-        }
-        val totalDesired = desires.values.fold(BigDecimal.ZERO, BigDecimal::add)
-        if (totalDesired <= BigDecimal.ZERO) return
-
-        val scale = if (totalDesired > qtyBought)
-            qtyBought.divide(totalDesired, 10, java.math.RoundingMode.HALF_UP)
-        else BigDecimal.ONE
-
-        for (g in active) {
-            val alloc = (desires[g.name]!! * scale).setScale(4, java.math.RoundingMode.HALF_UP)
-            groupRemaining[g.name] = (groupRemaining[g.name]!! - alloc).max(BigDecimal.ZERO)
-        }
-    }
-
     // ─── Arbitrage phase ──────────────────────────────────────────────────────
 
+    /**
+     * Relocates existing position to a more profitable quarter without changing
+     * total inventory or making the charging layout infeasible.
+     *
+     * If the updated quarter has a cheaper ask, position may be sold from another
+     * quarter and bought here. If it has a better bid, position may be sold here
+     * and replaced in a cheaper quarter. Every proposed move is capped by
+     * [transferableQuantity], which verifies the destination can cover the demand
+     * exposed by removing energy from the source.
+     *
+     * @param now current time used to exclude expired candidate quarters.
+     * @param updatedQuarter quarter whose best price changed.
+     * @param overview current best bid/ask and quantities for every quarter.
+     */
     private fun executeArbitrage(now: LocalDateTime, updatedQuarter: LocalDateTime, overview: Map<LocalDateTime, QuarterBestLevel>) {
         val qtBook   = overview[updatedQuarter] ?: return
         val prevBook = previousSnapshot[updatedQuarter]
@@ -203,16 +215,10 @@ class OptimizationService(
             return
         }
 
-        // Snapshot of actual remaining need — used as soft cap for arbitrage buys
-        val currentGroupRemaining = chargingNeedAggregator.getGroupRemaining()
-
         // ── Case A: ask dropped → BUY here, SELL at other quarters with highest bid ──
         if (askImproved && newAsk != null) {
             val askQtyAtUpdated  = qtBook.bestAskQuantity ?: BigDecimal.ZERO
-            val currentPosHere   = positionManager.getPosition(updatedQuarter)
-            val maxBuyable       = (chargingNeedAggregator.maxBuyable(updatedQuarter) - currentPosHere).max(BigDecimal.ZERO)
-            val softLimit        = (chargingNeedAggregator.softBuyable(updatedQuarter, currentGroupRemaining) - currentPosHere).max(BigDecimal.ZERO)
-            var remainingToBuy   = maxBuyable.min(askQtyAtUpdated).min(softLimit)
+            var remainingToBuy   = askQtyAtUpdated
 
             val sellCandidates = overview.values
                 .filter { it.deliveryStartTime != updatedQuarter }
@@ -225,7 +231,11 @@ class OptimizationService(
                 val bidPrice = candidate.bestBidPrice ?: continue
                 val bidQtyAtCandidate = candidate.bestBidQuantity ?: BigDecimal.ZERO
                 val sellable = positionManager.getPosition(candidate.deliveryStartTime).min(bidQtyAtCandidate)
-                val qty = remainingToBuy.min(sellable)
+                val qty = transferableQuantity(
+                    sourceQuarter = candidate.deliveryStartTime,
+                    destinationQuarter = updatedQuarter,
+                    maxQuantity = remainingToBuy.min(sellable)
+                )
                 if (qty > BigDecimal.ZERO) {
                     log.info(
                         "[Arb/AskDrop] SELL {}MWh@{} q={} | BUY {}MWh@{} q={} | spread={}",
@@ -257,12 +267,11 @@ class OptimizationService(
                 if (remainingToSell <= BigDecimal.ZERO) break
                 val askPrice = candidate.bestAskPrice ?: continue
                 val askQtyAtCandidate    = candidate.bestAskQuantity ?: BigDecimal.ZERO
-                val currentPosCandidate  = positionManager.getPosition(candidate.deliveryStartTime)
-                val softLimitAtCandidate = (chargingNeedAggregator.softBuyable(candidate.deliveryStartTime, currentGroupRemaining) - currentPosCandidate).max(BigDecimal.ZERO)
-                val buyable = (chargingNeedAggregator.maxBuyable(candidate.deliveryStartTime) - currentPosCandidate).max(BigDecimal.ZERO)
-                        .min(askQtyAtCandidate)
-                        .min(softLimitAtCandidate)
-                val qty = remainingToSell.min(buyable)
+                val qty = transferableQuantity(
+                    sourceQuarter = updatedQuarter,
+                    destinationQuarter = candidate.deliveryStartTime,
+                    maxQuantity = remainingToSell.min(askQtyAtCandidate)
+                )
                 if (qty > BigDecimal.ZERO) {
                     log.info(
                         "[Arb/BidRise] SELL {}MWh@{} q={} | BUY {}MWh@{} q={} | spread={}",
@@ -278,5 +287,53 @@ class OptimizationService(
                 }
             }
         }
+    }
+
+    /**
+     * Calculates how much position can move without making the resulting charging
+     * layout infeasible. The source position is reduced hypothetically, then the
+     * shared strategy determines which demand became uncovered and whether the
+     * destination quarter can cover it.
+     *
+     * This is a read-only simulation. The real [positionManager] is changed only
+     * after the caller receives a positive quantity and executes the paired trade.
+     *
+     * @param sourceQuarter quarter from which inventory would be sold.
+     * @param destinationQuarter quarter in which replacement inventory would be bought.
+     * @param maxQuantity upper bound from market liquidity and source inventory.
+     * @return the MWh that can safely be moved while respecting destination power
+     * capacity, charging windows and currently uncovered group demand.
+     */
+    private fun transferableQuantity(
+        sourceQuarter: LocalDateTime,
+        destinationQuarter: LocalDateTime,
+        maxQuantity: BigDecimal
+    ): BigDecimal {
+        if (maxQuantity <= BigDecimal.ZERO) return BigDecimal.ZERO
+
+        val positionsAfterSale = positionManager.getAllPositions().toMutableMap()
+        val sourcePosition = positionsAfterSale[sourceQuarter] ?: BigDecimal.ZERO
+        val removed = sourcePosition.min(maxQuantity)
+        if (removed <= BigDecimal.ZERO) return BigDecimal.ZERO
+
+        positionsAfterSale[sourceQuarter] = sourcePosition - removed
+        val uncovered = allocationStrategy.allocatePositions(
+            groups = chargingNeedAggregator.groups,
+            remainingNeed = chargingNeedAggregator.getGroupRemaining(),
+            positions = positionsAfterSale
+        ).remainingByGroup
+
+        val destinationPosition = positionsAfterSale[destinationQuarter] ?: BigDecimal.ZERO
+        val hardHeadroom = (
+            chargingNeedAggregator.maxBuyable(destinationQuarter) - destinationPosition
+            ).max(BigDecimal.ZERO)
+        val coverableAtDestination = allocationStrategy.allocateQuarter(
+            groups = chargingNeedAggregator.groups,
+            remainingNeed = uncovered,
+            quarter = destinationQuarter,
+            availableEnergy = removed
+        ).allocatedEnergy
+
+        return removed.min(hardHeadroom).min(coverableAtDestination)
     }
 }

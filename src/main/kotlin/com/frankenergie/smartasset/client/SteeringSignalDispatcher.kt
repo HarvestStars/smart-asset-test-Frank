@@ -1,6 +1,7 @@
 package com.frankenergie.smartasset.client
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.frankenergie.smartasset.allocation.ChargingAllocationStrategy
 import com.frankenergie.smartasset.model.SteeringSignal
 import com.frankenergie.smartasset.service.ChargingNeedAggregator
 import org.slf4j.LoggerFactory
@@ -41,7 +42,8 @@ import java.time.LocalDateTime
 @Component
 class SteeringSignalDispatcher(
     private val objectMapper: ObjectMapper,
-    private val chargingNeedAggregator: ChargingNeedAggregator
+    private val chargingNeedAggregator: ChargingNeedAggregator,
+    private val allocationStrategy: ChargingAllocationStrategy
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -63,68 +65,45 @@ class SteeringSignalDispatcher(
             .filterKeys { (_, quarter) -> quarter in quarters }
             .mapValues { (_, signal) -> signal.commandedEnergyMwh }
 
+    /**
+     * Converts the latest position layout into group commands and emits only
+     * signals whose assigned energy changed since the previous dispatch.
+     *
+     * @param positions currently owned energy in MWh per delivery quarter.
+     */
     fun dispatch(positions: Map<LocalDateTime, BigDecimal>) {
         val newSignals = deriveSignals(positions)
         emitChanged(newSignals)
     }
 
     /**
-     * Quarter-centric proportional allocation.
-     *
-     * Iterates quarters in time order.  For each quarter, all groups that are
-     * active (window covers this quarter, remaining need > 0) compete for the
-     * available position.  Their shares are scaled by their desire so that a
-     * group with larger maxPower gets a proportionally larger slice of scarce
-     * capacity, rather than being starved by a lower-power group that happened
-     * to be processed first.
+     * Uses the configured allocation strategy to turn market-level positions
+     * into `(group, quarter)` energy assignments, then converts those assignments
+     * to external steering-signal objects.
      */
     private fun deriveSignals(
         positions: Map<LocalDateTime, BigDecimal>
     ): Map<Pair<String, LocalDateTime>, SteeringSignal> {
+        val plan = allocationStrategy.allocatePositions(
+            groups = chargingNeedAggregator.groups,
+            remainingNeed = chargingNeedAggregator.getGroupRemaining(),
+            positions = positions
+        )
 
-        // Mutable remaining-need register, seeded from current dynamic state (not initial config)
-        val remaining: MutableMap<String, BigDecimal> = chargingNeedAggregator.getGroupRemaining().toMutableMap()
-
-        val signals = mutableMapOf<Pair<String, LocalDateTime>, SteeringSignal>()
-
-        for (quarter in positions.keys.sorted()) {
-            val pos = positions[quarter] ?: continue
-            if (pos <= BigDecimal.ZERO) continue
-
-            // Groups whose window covers this quarter and still need charge
-            val active = chargingNeedAggregator.groups.filter { g ->
-                chargingNeedAggregator.isInGroupWindow(quarter, g) &&
-                (remaining[g.name] ?: BigDecimal.ZERO) > BigDecimal.ZERO
-            }
-            if (active.isEmpty()) continue
-
-            // Desire: how much each active group would ideally take from this quarter
-            val desires: Map<String, BigDecimal> = active.associate { g ->
-                g.name to (remaining[g.name]!!).min(g.maxPowerMW * BigDecimal("0.25"))
-            }
-            val totalDesired = desires.values.fold(BigDecimal.ZERO, BigDecimal::add)
-
-            // Scale factor < 1 only when position is the scarce resource
-            val scaleFactor = if (totalDesired > pos)
-                pos.divide(totalDesired, 10, RoundingMode.HALF_UP)
-            else BigDecimal.ONE
-
-            for (g in active) {
-                val allocation = (desires[g.name]!! * scaleFactor)
-                    .setScale(4, RoundingMode.HALF_UP)
-                if (allocation <= BigDecimal.ZERO) continue
-
-                signals[g.name to quarter] = SteeringSignal(
-                    group             = g.name,
-                    deliveryStart     = quarter,
-                    deliveryEnd       = quarter.plusMinutes(15),
-                    commandedPowerMw  = allocation.divide(BigDecimal("0.25"), 4, RoundingMode.HALF_UP),
-                    commandedEnergyMwh = allocation
-                )
-                remaining[g.name] = (remaining[g.name]!! - allocation).max(BigDecimal.ZERO)
-            }
+        return plan.allocations.mapValues { (key, allocation) ->
+            val (groupName, quarter) = key
+            SteeringSignal(
+                group = groupName,
+                deliveryStart = quarter,
+                deliveryEnd = quarter.plusMinutes(15),
+                commandedPowerMw = allocation.divide(
+                    BigDecimal("0.25"),
+                    4,
+                    RoundingMode.HALF_UP
+                ),
+                commandedEnergyMwh = allocation
+            )
         }
-        return signals
     }
 
     private fun emitChanged(newSignals: Map<Pair<String, LocalDateTime>, SteeringSignal>) {

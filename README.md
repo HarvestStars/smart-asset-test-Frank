@@ -9,92 +9,95 @@ event-driven loop.
 
 ## Pipeline Architecture
 
-Every market event flows through the same 5-layer pipeline.
+Every market event flows through the same 6-layer pipeline.
 The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
+Procurement and dispatch share one stateless allocation strategy, so both layers
+interpret the position layout in exactly the same way.
 
 ```
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   SMART ASSET PIPELINE
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
   ① Market Input            ② Order Book                ③ Optimizer
 
-  ┌─────────────────┐       ┌────────────────────────┐    ┌───────────────────────────┐
-  │ REST API        │──────►│ OrderBookService       │───►│ OptimizationService       │
-  │                 │       │                        │    │                           │
-  │ POST /order     │       │ .bestAskPrice          │    │ @EventListener            │
-  │ side: BUY/SELL  │       │ .bestBidPrice          │    │ onOrderBookUpdated()      │
-  │ price           │       │ .bestAskQuantity       │    │                           │
-  │ quantity        │       │ .bestBidQuantity       │    │ ── time advance ──        │
-  │ deliveryStart   │       │ .getQuarterOverviews() │    │ expireBeforeTime(now)     │
-  │ deliveryEnd     │       │ .getQuarterOrderBook() │    │ consumeChargedEnergy()    │
-  └─────────────────┘       │ .getAllSellOrdersSorted│    │                           │
-                            │                        │    │ ── stale-event guard ──   │
-                  publishes │ OrderBookUpdatedEvent  │    │ if quarter < now → drop   │
-                            │  .deliveryStartTime    │    │                           │
-                            │  .fromOptimizer        │    │ ── phase select ──        │
-                            └────────────────────────┘    │ pos < need → FILL-UP      │
-                                                          │ pos ≥ need → ARBITRAGE    │
-                                                          └───────────────────────────┘
-                                                                        │
-                  ┌─────────────────────────────────────────────────────┘
-                  │
-                  ▼
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  ┌─────────────────┐       ┌────────────────────────┐    ┌────────────────────────────┐
+  │ REST API        │──────►│ OrderBookService       │───►│ OptimizationService        │
+  │                 │       │                        │    │                            │
+  │ POST /order     │       │ order books by quarter │    │ expire delivered positions │
+  │ BUY / SELL      │       │ best bid / ask levels  │    │ reject stale events        │
+  │ price / quantity│       │ globally sorted asks   │    │                            │
+  │ delivery window │       │                        │    │ totalPos < totalNeed       │
+  └─────────────────┘       │ publishes              │    │   → FILL-UP                │
+                            │ OrderBookUpdatedEvent  │───►│ totalPos ≥ totalNeed       │
+                            └────────────────────────┘    │   → ARBITRAGE              │
+                                                          └─────────────┬──────────────┘
+                                                                        │ reads / updates
+                                                                        ▼
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
   ④ Position & Need Management
 
-  ┌────────────────────────┐         ┌──────────────────────────────┐
-  │ PositionManager        │         │ ChargingNeedAggregator       │
-  │                        │         │                              │
-  │ positions: Map<        │         │ groups: List<ChargingGroup>  │
-  │   LocalDateTime, MWh>  │         │   .name                      │
-  │                        │         │   .startTime / endTime       │
-  │ .getPosition(quarter)  │         │   .neededChargeMWh           │
-  │ .adjustPosition(q, Δ)  │         │   .maxPowerMW                │
-  │ .totalPosition()       │         │                              │
-  │ .getAllPositions()     │         │ groupRemaining: Map<name,MWh>│
-  │ .expireBeforeTime(now) │         │                              │
-  │   └─ returns expired   │         │ .totalRemainingNeed()        │
-  │      quarters          │         │ .maxBuyable(quarter)         │
-  └────────────────────────┘         │ .softBuyable(q, remaining)   │
-                                     │ .getGroupRemaining()         │
-                                     │ .consumeChargedEnergy(map)   │
-                                     └──────────────────────────────┘
+  ┌────────────────────────────┐      ┌────────────────────────────────┐
+  │ PositionManager            │      │ ChargingNeedAggregator         │
+  │                            │      │                                │
+  │ positions:                 │      │ groups: charging windows,      │
+  │ Map<quarter, MWh>          │      │ power limits and actual need   │
+  │                            │      │                                │
+  │ market inventory layout    │      │ groupRemaining:                │
+  │ (not permanently assigned  │      │ Map<group, uncharged MWh>      │
+  │  to charging groups)       │      │                                │
+  │                            │      │ decreases only after delivery  │
+  │ adjust / expire / snapshot │      │ maxBuyable / window checks     │
+  └──────────────┬─────────────┘      └───────────────┬────────────────┘
+                 │ positions                            │ actual remaining need
+                 └──────────────────┬───────────────────┘
+                                    ▼
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  ⑤ Charging Allocation Policy
 
-  ⑤ Execution Clients
+                ┌──────────────────────────────────────────────┐
+                │ ChargingAllocationStrategy                   │
+                │                                              │
+                │ default: PowerWeightedAllocationStrategy     │
+                │                                              │
+                │ allocatePositions(groups, need, positions)   │
+                │   → allocations[(group, quarter)]            │
+                │   → uncovered remaining by group             │
+                │                                              │
+                │ allocateQuarter(groups, remaining, q, MWh)   │
+                │   → useful capacity in one quarter           │
+                │   → next remaining snapshot                  │
+                │                                              │
+                │ stateless: no permanent group assignment     │
+                └───────────────┬──────────────────┬───────────┘
+                                │                  │
+                    procurement │                  │ dispatch
+                                ▼                  ▼
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+  ⑥ Execution Clients
 
   ┌──────────────────────────────┐      ┌──────────────────────────────────┐
   │ MarketOrderClient            │      │ SteeringSignalDispatcher         │
   │                              │      │                                  │
-  │ .placeBuy(q, end, qty, px)   │      │ lastSignals: Map<                │
-  │ .placeSell(q, end, qty, px)  │      │   (group, quarter), Signal>      │
-  │   ├─ calls OrderBookService  │      │                                  │
-  │   │  processOrder()          │      │ .dispatch(positions)             │
-  │   └─ appends to log          │      │   ├─ deriveSignals()             │
-  │                              │      │   │    desire_g = min(           │
-  │ .getAllOrders()              │      │   │      remaining_g,            │
-  │   └─ reads jsonl log         │      │   │      maxPower×0.25h)         │
-  │                              │      │   │    scale by pos if scarce    │
-  │ market_orders.jsonl          │      │   └─ emitChanged()               │
-  │   { orderId, side, qty, px,  │      │        zero-cancel deactivated   │
-  │     deliveryStart, status }  │      │        (group, quarter) pairs    │
-  └──────────────────────────────┘      │                                  │
-                                        │ .getLastSignalsForQuarters(set)  │
-                 feeds ◄────────────────│   └─ used by time-advance step   │
-          SourcingCostController        │                                  │
-          GET /api/sourcing-cost        │ steering_signals.jsonl           │
-          (VWAP of all BUY orders)      │   { group, deliveryStart/End,    │
-                                        │     commandedPowerMw, energyMwh }│
-                                        └──────────────────────────────────┘
+  │ execute optimizer BUY / SELL │      │ dispatch(current positions)      │
+  │ call OrderBookService        │      │                                  │
+  │ append market_orders.jsonl   │      │ allocation plan                  │
+  │                              │      │   → SteeringSignal per           │
+  │ GET sourcing cost reads log  │      │     (group, quarter)             │
+  └──────────────────────────────┘      │   → emit changed signals only    │
+                                        │   → zero cancelled assignments   │
+                                        │                                  │
+                                        │ steering_signals.jsonl           │
+                                        └────────────────┬─────────────────┘
                                                          │
                                                          ▼
                                                   EV Charging Groups
                                                   (A / B / C / D / E / F)
 
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 ```
 
 ---
@@ -102,42 +105,56 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
 ## Optimizer — Two-Phase State Machine
 
 ```
-                    OrderBookUpdatedEvent
-                            │
-                    ┌───────▼───────┐
-                    │ Time Advance  │  expireBeforeTime(now)
-                    │               │  consumeChargedEnergy()
-                    └───────┬───────┘
-                            │
-                    ┌───────▼───────┐
-                    │ Stale Guard   │  quarter < now  ──►  DROP
-                    └───────┬───────┘
-                            │
-             ┌──────────────▼──────────────┐
-             │ totalPos < totalNeed?       │
-             └────┬───────────────────┬────┘
-                 YES                 NO
-                  │                   │
-         ┌────────▼────────┐ ┌────────▼────────┐
-         │ FILL-UP         │ │ ARBITRAGE       │
-         │                 │ │                 │
-         │ scan ALL        │ │ anchor on       │
-         │ asks (asc)      │ │ updated qtr     │
-         │                 │ │                 │
-         │ per-qtr         │ │ ask dropped?    │
-         │ hard limit      │ │  BUY here       │
-         │ soft limit      │ │  SELL others    │
-         │                 │ │                 │
-         │ proportional    │ │ bid rose?       │
-         │ allocation      │ │  SELL here      │
-         │ per group       │ │  BUY others     │
-         └────────┬────────┘ └────────┬────────┘
-                  └─────────┬─────────┘
-                            │
-                   ┌────────▼────────┐
-                   │ dispatch()      │
-                   │ SteeringSignals │
-                   └─────────────────┘
+                         OrderBookUpdatedEvent
+                                  │
+                         ┌────────▼────────┐
+                         │ Time Advance    │  expire positions
+                         │                 │  consume delivered energy
+                         └────────┬────────┘
+                                  │
+                         ┌────────▼────────┐
+                         │ Stale Guard     │  past quarter ──► DROP
+                         └────────┬────────┘
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │ totalPos < totalNeed?     │
+                    └──────┬─────────────┬──────┘
+                          YES           NO
+                           │             │
+             ┌─────────────▼──────┐ ┌────▼─────────────────────┐
+             │ FILL-UP            │ │ ARBITRAGE                │
+             │                    │ │                          │
+             │ allocate existing  │ │ detect improved ask/bid  │
+             │ positions against  │ │ on updated quarter       │
+             │ actual group need  │ │                          │
+             │                    │ │ for each candidate move  │
+             │ result:            │ │  1. hypothetically sell  │
+             │ uncovered demand   │ │     source position      │
+             │                    │ │  2. rebuild uncovered    │
+             │ scan asks by price │ │     group demand         │
+             │                    │ │  3. allocate destination │
+             │ candidate = min(   │ │     against uncovered    │
+             │  total shortfall,  │ │  4. cap transferable qty │
+             │  hard headroom,    │ │                          │
+             │  ask quantity)     │ │ totalPos stays constant  │
+             │                    │ │                          │
+             │ allocate candidate │ │ no permanent group       │
+             │ once → buy useful  │ │ assignment is stored     │
+             │ qty + next         │ │                          │
+             │ uncovered demand   │ │                          │
+             └──────────┬─────────┘ └───────────┬──────────────┘
+                        └────────────┬───────────┘
+                                     │
+                    ┌────────────────▼────────────────┐
+                    │ Rebuild allocation plan         │
+                    │ from final positions + actual   │
+                    │ group remaining need            │
+                    └────────────────┬────────────────┘
+                                     │
+                          ┌──────────▼──────────┐
+                          │ dispatch changed    │
+                          │ SteeringSignals     │
+                          └─────────────────────┘
 ```
 
 ---
@@ -147,29 +164,58 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
 | Constraint | Formula | Purpose |
 |---|---|---|
 | Hard Limit | `maxBuyable(q) − position(q)` | Physical power ceiling |
-| Soft Limit | `Σ min(remaining_g, maxPower_g × 0.25h)` | Only buy what groups still need |
-| Order Cap | `min(shortfall, hard, soft, askEntry.qty)` | Final buy quantity |
+| Uncovered Remaining | `allocatePositions(groups, actualRemaining, positions).remainingByGroup` | Demand not covered by the current layout |
+| Candidate Quantity | `min(shortfall, hardHeadroom, askEntry.qty)` | Maximum allowed by demand, physical capacity and market supply |
+| Final Buy Quantity | `allocateQuarter(groups, uncoveredRemaining, q, candidateQuantity).allocatedEnergy` | Buy only the candidate energy assignable in this quarter |
 
-Group allocation after each buy mirrors the steering signal proportional logic, keeping procurement and dispatch self-consistent.
+Fill-up calls `allocateQuarter` once per ask. That single result provides both
+the useful buy quantity (`allocatedEnergy`) and the `remainingByGroup` snapshot
+for the next ask. This prevents two different quarters in the same scan from
+covering the same group demand.
+
+`uncovered remaining` is temporary. It is rebuilt from actual group demand and the
+latest positions on every optimization cycle, so arbitrage can freely relocate
+inventory without creating a permanent group assignment.
 
 ---
 
-## Steering Signal Allocation (per quarter)
+## Shared Allocation Strategy
+
+`PowerWeightedAllocationStrategy` is the current implementation of
+`ChargingAllocationStrategy`. Both procurement and dispatch call this module.
 
 ```
-For each quarter Q (time-sorted):
-  active_groups = groups where window covers Q AND remaining > 0
+allocatePositions(groups, remainingNeed, positions):
+  remaining = copy of actual remaining need
 
-  desire_g   = min(remaining_g, maxPower_g × 0.25h)
-  totalDesired = Σ desire_g
+  for each quarter Q in delivery-time order:
+      result = allocateQuarter(groups, remaining, Q, position[Q])
+      store result.allocations as (group, Q) assignments
+      remaining = result.remainingByGroup
 
-  if position[Q] ≥ totalDesired:
-      allocation_g = desire_g          ← every group gets what it wants
+  return:
+      allocations       → used by SteeringSignalDispatcher
+      remainingByGroup  → uncovered remaining used by Optimizer
+
+allocateQuarter(groups, remaining, Q, availableEnergy):
+  active_groups = groups whose window covers Q and remaining > 0
+
+  desire_g = min(remaining_g, maxPower_g × 0.25h)
+
+  if availableEnergy ≥ Σ desire_g:
+      allocation_g = desire_g
   else:
-      allocation_g = desire_g × (position[Q] / totalDesired)   ← scale down fairly
+      allocation_g = desire_g × (availableEnergy / Σ desire_g)
+                     ↑ proportional to each group's quarter power demand
+
+  return allocations and the next remaining snapshot
 ```
 
-Cancelled slots (group no longer receiving energy) get an explicit zero-power signal.
+The strategy is stateless and interchangeable. A future membership-priority
+implementation can replace the power-weighted policy, and the same policy will
+automatically affect both Fill-up procurement and steering-signal dispatch.
+
+Cancelled `(group, quarter)` slots still receive an explicit zero-power signal.
 
 ---
 
