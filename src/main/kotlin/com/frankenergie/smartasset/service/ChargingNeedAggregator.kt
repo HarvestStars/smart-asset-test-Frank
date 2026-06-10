@@ -48,14 +48,35 @@ class ChargingNeedAggregator(private val config: SmartAssetConfig) {
         groups.sumOf { it.neededChargeMWh }
 
     /**
-     * Maximum energy physically consumable in [quarter].
-     * Returns ZERO when no group has a window covering this quarter,
-     * which prevents the optimizer from buying "stranded" energy.
+     * Hard upper bound: maximum energy physically consumable in [quarter].
+     * Assumes every overlapping group still needs its full quota.
+     * Returns ZERO when no group has a window covering this quarter.
      */
     fun maxBuyable(quarter: LocalDateTime): BigDecimal {
         return groups
             .filter { isInGroupWindow(quarter, it) }
             .fold(BigDecimal.ZERO) { acc, g -> acc + g.maxPowerMW * QUARTER_HOURS }
+    }
+
+    /**
+     * Soft upper bound: how much energy active groups ACTUALLY still need from [quarter],
+     * given their current [groupRemaining] balances.
+     *
+     * Uses the same desire formula as SteeringSignalDispatcher.deriveSignals:
+     *   desire_g = min(remaining_g, maxPower_g × 0.25 h)
+     *
+     * This prevents the optimizer from buying energy in a quarter that no group
+     * still needs, even if the hard limit (maxBuyable) is non-zero.
+     * [groupRemaining] keys are group names; missing entries default to the group's
+     * full neededChargeMWh (conservative upper bound).
+     */
+    fun softBuyable(quarter: LocalDateTime, groupRemaining: Map<String, BigDecimal>): BigDecimal {
+        return groups
+            .filter { isInGroupWindow(quarter, it) }
+            .fold(BigDecimal.ZERO) { acc, g ->
+                val remaining = groupRemaining[g.name] ?: g.neededChargeMWh
+                acc + remaining.min(g.maxPowerMW * QUARTER_HOURS)
+            }
     }
 
     fun isInGroupWindow(quarter: LocalDateTime, group: ChargingGroup): Boolean {

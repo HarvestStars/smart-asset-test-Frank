@@ -13,5 +13,7 @@ data class MarketOrder(
     @JsonProperty("side")               val side: OrderSide,
     @JsonProperty("quantity_mwh")       val quantityMwh: BigDecimal,
     @JsonProperty("price_eur_per_mwh")  val priceEurPerMwh: BigDecimal,
+    // Confirmation status returned by the order processing API ("ACCEPTED", etc.)
+    @JsonProperty("status")             val status: String = "ACCEPTED",
     @JsonProperty("timestamp")          val timestamp: Instant = Instant.now()
 )

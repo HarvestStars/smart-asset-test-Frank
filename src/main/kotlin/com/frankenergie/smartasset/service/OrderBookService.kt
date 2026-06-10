@@ -37,11 +37,13 @@ class OrderBookService(private val eventPublisher: ApplicationEventPublisher) {
      * 1. Locate (or create) the quarter's order book.
      * 2. Match against opposite-side orders, cancelling quantities.
      * 3. Any remaining quantity is added to the book.
-     * 4. Publish OrderBookUpdatedEvent so downstream listeners can react
-     *    (e.g. OptimizationService — to be wired in requirement 3).
+     * 4. Publish OrderBookUpdatedEvent so downstream listeners can react.
+     *
+     * [fromOptimizer] is forwarded to the event so that OptimizationService
+     * can ignore events triggered by its own trades and avoid re-entrant loops.
      */
     @Synchronized
-    fun processOrder(request: OrderUpdateRequest): OrderUpdateResponse {
+    fun processOrder(request: OrderUpdateRequest, fromOptimizer: Boolean = false): OrderUpdateResponse {
         val book = books.getOrPut(request.deliveryStartTime) {
             QuarterBook(request.deliveryStartTime, request.deliveryEndTime)
         }
@@ -99,7 +101,7 @@ class OrderBookService(private val eventPublisher: ApplicationEventPublisher) {
         }
 
         // Notify interested listeners (Optimization, metrics, etc.)
-        eventPublisher.publishEvent(OrderBookUpdatedEvent(this, request.deliveryStartTime))
+        eventPublisher.publishEvent(OrderBookUpdatedEvent(this, request.deliveryStartTime, fromOptimizer))
 
         return OrderUpdateResponse(
             orderId = UUID.randomUUID().toString(),
