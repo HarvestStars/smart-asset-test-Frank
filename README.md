@@ -19,25 +19,25 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
 
   ① Market Input            ② Order Book                ③ Optimizer
 
-  ┌─────────────────┐       ┌──────────────────────┐    ┌───────────────────────────┐
-  │ REST API        │──────►│ OrderBookService      │───►│ OptimizationService       │
-  │                 │       │                       │    │                           │
-  │ POST /order     │       │ .bestAskPrice         │    │ @EventListener            │
-  │ side: BUY/SELL  │       │ .bestBidPrice         │    │ onOrderBookUpdated()      │
+  ┌─────────────────┐       ┌────────────────────────┐    ┌───────────────────────────┐
+  │ REST API        │──────►│ OrderBookService       │───►│ OptimizationService       │
+  │                 │       │                        │    │                           │
+  │ POST /order     │       │ .bestAskPrice          │    │ @EventListener            │
+  │ side: BUY/SELL  │       │ .bestBidPrice          │    │ onOrderBookUpdated()      │
   │ price           │       │ .bestAskQuantity       │    │                           │
   │ quantity        │       │ .bestBidQuantity       │    │ ── time advance ──        │
   │ deliveryStart   │       │ .getQuarterOverviews() │    │ expireBeforeTime(now)     │
   │ deliveryEnd     │       │ .getQuarterOrderBook() │    │ consumeChargedEnergy()    │
   └─────────────────┘       │ .getAllSellOrdersSorted│    │                           │
-                            │                       │    │ ── stale-event guard ──   │
+                            │                        │    │ ── stale-event guard ──   │
                   publishes │ OrderBookUpdatedEvent  │    │ if quarter < now → drop   │
-                            │  .deliveryStartTime   │    │                           │
-                            │  .fromOptimizer       │    │ ── phase select ──        │
-                            └──────────────────────┘    │ pos < need → FILL-UP      │
-                                                         │ pos ≥ need → ARBITRAGE    │
-                                                         └───────────────────────────┘
-                                                                      │
-                  ┌───────────────────────────────────────────────────┘
+                            │  .deliveryStartTime    │    │                           │
+                            │  .fromOptimizer        │    │ ── phase select ──        │
+                            └────────────────────────┘    │ pos < need → FILL-UP      │
+                                                          │ pos ≥ need → ARBITRAGE    │
+                                                          └───────────────────────────┘
+                                                                        │
+                  ┌─────────────────────────────────────────────────────┘
                   │
                   ▼
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -45,7 +45,7 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
   ④ Position & Need Management
 
   ┌────────────────────────┐         ┌──────────────────────────────┐
-  │ PositionManager        │         │ ChargingNeedAggregator        │
+  │ PositionManager        │         │ ChargingNeedAggregator       │
   │                        │         │                              │
   │ positions: Map<        │         │ groups: List<ChargingGroup>  │
   │   LocalDateTime, MWh>  │         │   .name                      │
@@ -53,7 +53,7 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
   │ .getPosition(quarter)  │         │   .neededChargeMWh           │
   │ .adjustPosition(q, Δ)  │         │   .maxPowerMW                │
   │ .totalPosition()       │         │                              │
-  │ .getAllPositions()      │         │ groupRemaining: Map<name,MWh>│
+  │ .getAllPositions()     │         │ groupRemaining: Map<name,MWh>│
   │ .expireBeforeTime(now) │         │                              │
   │   └─ returns expired   │         │ .totalRemainingNeed()        │
   │      quarters          │         │ .maxBuyable(quarter)         │
@@ -67,7 +67,7 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
   ⑤ Execution Clients
 
   ┌──────────────────────────────┐      ┌──────────────────────────────────┐
-  │ MarketOrderClient            │      │ SteeringSignalDispatcher          │
+  │ MarketOrderClient            │      │ SteeringSignalDispatcher         │
   │                              │      │                                  │
   │ .placeBuy(q, end, qty, px)   │      │ lastSignals: Map<                │
   │ .placeSell(q, end, qty, px)  │      │   (group, quarter), Signal>      │
@@ -75,18 +75,18 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
   │   │  processOrder()          │      │ .dispatch(positions)             │
   │   └─ appends to log          │      │   ├─ deriveSignals()             │
   │                              │      │   │    desire_g = min(           │
-  │ .getAllOrders()               │      │   │      remaining_g,            │
+  │ .getAllOrders()              │      │   │      remaining_g,            │
   │   └─ reads jsonl log         │      │   │      maxPower×0.25h)         │
   │                              │      │   │    scale by pos if scarce    │
-  │ market_orders.jsonl          │      │   └─ emitChanged()              │
-  │   { orderId, side, qty, px,  │      │        zero-cancel deactivated  │
+  │ market_orders.jsonl          │      │   └─ emitChanged()               │
+  │   { orderId, side, qty, px,  │      │        zero-cancel deactivated   │
   │     deliveryStart, status }  │      │        (group, quarter) pairs    │
   └──────────────────────────────┘      │                                  │
                                         │ .getLastSignalsForQuarters(set)  │
-                 feeds ◄────────────────│   └─ used by time-advance step  │
+                 feeds ◄────────────────│   └─ used by time-advance step   │
           SourcingCostController        │                                  │
           GET /api/sourcing-cost        │ steering_signals.jsonl           │
-          (VWAP of all BUY orders)      │   { group, deliveryStart/End,   │
+          (VWAP of all BUY orders)      │   { group, deliveryStart/End,    │
                                         │     commandedPowerMw, energyMwh }│
                                         └──────────────────────────────────┘
                                                          │
@@ -103,36 +103,36 @@ The only branching point is inside the Optimizer (Fill-up vs Arbitrage).
 
 ```
                     OrderBookUpdatedEvent
-                           │
-                    ┌──────▼──────┐
-                    │ Time Advance │  expireBeforeTime(now)
-                    │             │  consumeChargedEnergy()
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │ Stale Guard │  quarter < now  ──►  DROP
-                    └──────┬──────┘
-                           │
-               ┌───────────▼────────────┐
-               │   totalPos < totalNeed? │
-               └───────┬────────┬───────┘
-                      YES       NO
-                       │         │
-             ┌─────────▼──┐  ┌───▼──────────┐
-             │  FILL-UP   │  │  ARBITRAGE   │
-             │            │  │              │
-             │ scan ALL   │  │ anchor on    │
-             │ asks (asc) │  │ updated qtr  │
-             │            │  │              │
-             │ per-qtr    │  │ ask dropped? │
-             │ hard limit │  │  BUY here    │
-             │ soft limit │  │  SELL others │
-             │            │  │              │
-             │ proportional│  │ bid rose?    │
-             │ allocation  │  │  SELL here  │
-             │ per group  │  │  BUY others  │
-             └─────┬──────┘  └──────┬───────┘
-                   └────────┬────────┘
+                            │
+                    ┌───────▼───────┐
+                    │ Time Advance  │  expireBeforeTime(now)
+                    │               │  consumeChargedEnergy()
+                    └───────┬───────┘
+                            │
+                    ┌───────▼───────┐
+                    │ Stale Guard   │  quarter < now  ──►  DROP
+                    └───────┬───────┘
+                            │
+             ┌──────────────▼──────────────┐
+             │ totalPos < totalNeed?       │
+             └────┬───────────────────┬────┘
+                 YES                 NO
+                  │                   │
+         ┌────────▼────────┐ ┌────────▼────────┐
+         │ FILL-UP         │ │ ARBITRAGE       │
+         │                 │ │                 │
+         │ scan ALL        │ │ anchor on       │
+         │ asks (asc)      │ │ updated qtr     │
+         │                 │ │                 │
+         │ per-qtr         │ │ ask dropped?    │
+         │ hard limit      │ │  BUY here       │
+         │ soft limit      │ │  SELL others    │
+         │                 │ │                 │
+         │ proportional    │ │ bid rose?       │
+         │ allocation      │ │  SELL here      │
+         │ per group       │ │  BUY others     │
+         └────────┬────────┘ └────────┬────────┘
+                  └─────────┬─────────┘
                             │
                    ┌────────▼────────┐
                    │ dispatch()      │
