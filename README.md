@@ -282,3 +282,18 @@ smart-asset.charging-groups[0].max-power-mw=0.5
 - Event-driven: `@EventListener` + `@Synchronized` (single-threaded optimizer loop)
 - Config binding: `@ConfigurationProperties`
 - No external message broker — in-process Spring events
+
+---
+
+## Market Simulator
+
+The [`simulator`](simulator/README.md) directory contains a Python 3.10+
+two-quarter market generator, an auto-refreshing order-book dashboard, and
+controlled matching/optimizer scenarios.
+
+```powershell
+.\gradlew.bat bootRun
+python -m simulator all
+```
+
+Then open `http://127.0.0.1:8090`.
